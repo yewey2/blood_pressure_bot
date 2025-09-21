@@ -104,7 +104,7 @@ def save_reading_to_firestore(sbp: int, dbp: int, hr: int):
             'dbp': int(dbp),
             'hr': int(hr)
         })
-        logger.info(f"Successfully saved reading for user {user_id} to Firestore.")
+        logger.info(f"Successfully saved reading to Firestore.")
         return True
     except Exception as e:
         logger.error(f"Error saving to Firestore: {e}")
