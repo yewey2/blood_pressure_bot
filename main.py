@@ -39,7 +39,14 @@ logger = logging.getLogger(__name__)
 
 try:
     # Make sure 'firebase-credentials.json' is in the same folder as your bot script
-    cred = credentials.Certificate("firebase-credentials.json")
+    if os.path.exists('firebase-credentials.json'):
+        cred = credentials.Certificate("firebase-credentials.json")
+    else:
+        firebase_creds_json_str = os.getenv("FIREBASE_CREDENTIALS_JSON")    
+        if not firebase_creds_json_str:
+            raise ValueError("FIREBASE_CREDENTIALS_JSON environment variable not set.")
+        firebase_creds_dict = json.loads(firebase_creds_json_str)
+        cred = credentials.Certificate(firebase_creds_dict)
     firebase_admin.initialize_app(cred)
     db = firestore.client()
     logger.info("✅ Firebase initialized successfully.")
