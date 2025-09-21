@@ -12,6 +12,11 @@ import traceback
 from dotenv import load_dotenv
 load_dotenv()
 
+import firebase_admin
+from firebase_admin import credentials, firestore
+from datetime import datetime
+import pytz
+
 import google.generativeai as genai
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
@@ -32,6 +37,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+try:
+    # Make sure 'firebase-credentials.json' is in the same folder as your bot script
+    cred = credentials.Certificate("firebase-credentials.json")
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+    logger.info("✅ Firebase initialized successfully.")
+except Exception as e:
+    logger.error(f"🔥 Error initializing Firebase: {e}. Make sure 'firebase-credentials.json' is present.")
+    db = None # Set db to None if initialization fails
+    raise Exception(f"🔥 Error initializing Firebase: {e}. Make sure 'firebase-credentials.json' is present.")
 
 # --- Gemini AI Function ---
 async def get_bp_from_image(image_bytes: bytes) -> dict:
@@ -73,6 +88,28 @@ ONLY provide the full JSON, nothing else, starting with ```json
         logger.error(f"Error processing image with Gemini: {e}")
         return {"error": "Could not process the image or parse the response."}
 
+# --- NEW FIREBASE FUNCTION ---
+def save_reading_to_firestore(sbp: int, dbp: int, hr: int):
+    """Saves a new blood pressure reading to the Firestore database."""
+    if not db:
+        logger.error("Firestore client not available. Skipping save.")
+        return False
+    
+    try:
+        # Create a new document in the 'readings' collection
+        doc_ref = db.collection('readings').document()
+        doc_ref.set({
+            'timestamp': datetime.now(pytz.timezone('Asia/Singapore')), # Use current server time
+            'sbp': int(sbp),
+            'dbp': int(dbp),
+            'hr': int(hr)
+        })
+        logger.info(f"Successfully saved reading for user {user_id} to Firestore.")
+        return True
+    except Exception as e:
+        logger.error(f"Error saving to Firestore: {e}")
+        return False
+
 # --- Telegram Bot Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for the /start command."""
@@ -84,7 +121,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for when the user sends a photo."""
     chat_id = update.effective_chat.id
-    if chat_id != TELEGRAM_USER_ID:  # Replace with your Telegram user ID for security
+    if int(chat_id) != int(TELEGRAM_USER_ID):  # Replace with your Telegram user ID for security
         await context.bot.send_message(chat_id=chat_id, text="Sorry, you are not authorized to use this bot.")
         return
     
@@ -106,15 +143,39 @@ async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         if bp_data and bp_data.get('status') == "success":
-            sbp = bp_data.get('values').get('SBP', 'N/A')
-            dbp = bp_data.get('values').get('DBP', 'N/A')
-            hr = bp_data.get('values').get('HR', 'N/A')
-            reply_text = (
-                f"✅ **Blood Pressure Reading Extracted**\n\n"
-                f"🩺 **Systolic (SBP):** {sbp}\n"
-                f"❤️ **Diastolic (DBP):** {dbp}\n"
-                f"💓 **Heart Rate (HR):** {hr}"
-            )
+            values = bp_data.get('values', {})
+            sbp = values.get('SBP')
+            dbp = values.get('DBP')
+            hr = values.get('HR')
+            # Ensure all values are present before trying to save
+            if sbp is not None and dbp is not None and hr is not None:
+                # --- SAVE TO FIREBASE ---
+                save_successful = save_reading_to_firestore(
+                    sbp=sbp,
+                    dbp=dbp,
+                    hr=hr
+                )
+                reply_text = (
+                    f"✅ **Blood Pressure Reading Extracted**\n\n"
+                    f"🩺 **Systolic (SBP):** {sbp}\n"
+                    f"❤️ **Diastolic (DBP):** {dbp}\n"
+                    f"💓 **Heart Rate (HR):** {hr}\n\n"
+                )
+                if save_successful:
+                    reply_text += "💾 *Data saved to database.*"
+                else:
+                    reply_text += "⚠️ *Could not save data to database.*"
+            else:
+                sbp_text = sbp if sbp is not None else 'N/A'
+                dbp_text = dbp if dbp is not None else 'N/A'
+                hr_text = hr if hr is not None else 'N/A'
+                reply_text = (
+                    f"🟡 **Partial Reading Extracted**\n\n"
+                    f"🩺 **Systolic (SBP):** {sbp_text}\n"
+                    f"❤️ **Diastolic (DBP):** {dbp_text}\n"
+                    f"💓 **Heart Rate (HR):** {hr_text}\n\n"
+                    f"💾 *Not saved to database because some values are missing.*"
+                )
         elif bp_data and bp_data.get('status' == "failed"):
             reply_text = f"Sorry, I couldn't read the values. Please try a clearer picture."
         else:
@@ -128,6 +189,7 @@ async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Log errors caused by updates."""
     logger.error("Exception while handling an update:", exc_info=context.error)
+
 
 
 # --- Main Application Setup ---
