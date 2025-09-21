@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 5. Copy Application Code: Copy your main script and credentials file.
 COPY main.py .
-COPY firebase-credentials.json .
+# COPY firebase-credentials.json .
 
 # 6. Run Command: Specify the command to run when the container starts.
 CMD ["python", "main.py"]
