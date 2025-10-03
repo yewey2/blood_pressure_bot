@@ -45,7 +45,7 @@ try:
         firebase_creds_json_str = os.getenv("FIREBASE_CREDENTIALS_JSON")    
         if not firebase_creds_json_str:
             raise ValueError("FIREBASE_CREDENTIALS_JSON environment variable not set.")
-        firebase_creds_dict = json.loads(firebase_creds_json_str)
+        firebase_creds_dict = json_repair.loads(firebase_creds_json_str)
         cred = credentials.Certificate(firebase_creds_dict)
     firebase_admin.initialize_app(cred)
     db = firestore.client()
