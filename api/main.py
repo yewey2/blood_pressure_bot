@@ -20,8 +20,6 @@ import logging
 from dataclasses import dataclass
 from http import HTTPStatus
 
-import uvicorn
-from asgiref.wsgi import WsgiToAsgi
 from flask import Flask, Response, abort, make_response, request
 
 from telegram import Update
@@ -81,10 +79,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")
 
 # Define configuration constants
-URL =  os.getenv("VERCEL_URL")
-URL = f"https://{URL}" if URL else "http://localhost:8000"
 ADMIN_CHAT_ID = TELEGRAM_USER_ID
-PORT = 8000
 TOKEN = TELEGRAM_BOT_TOKEN  # nosec B105
 
 
@@ -215,75 +210,89 @@ async def webhook_update(update: WebhookUpdate, context: CustomContext) -> None:
     await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode=ParseMode.HTML)
 
 
-async def main() -> None:
-    """Set up PTB application and a web application for handling the incoming requests."""
-    context_types = ContextTypes(context=CustomContext)
-    # Here we set updater to None because we want our custom webhook server to handle the updates
-    # and hence we don't need an Updater instance
-    application = (
-        Application.builder().token(TOKEN).updater(None).context_types(context_types).build()
-    )
+# --- Build the PTB application at module level so it exists on every cold start ---
+context_types = ContextTypes(context=CustomContext)
+# updater=None: Telegram delivers updates via webhook, so we don't need an Updater.
+application = (
+    Application.builder().token(TOKEN).updater(None).context_types(context_types).build()
+)
 
-    # register handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(TypeHandler(type=WebhookUpdate, callback=webhook_update))
+# register handlers
+application.add_handler(CommandHandler("start", start))
+application.add_handler(TypeHandler(type=WebhookUpdate, callback=webhook_update))
+application.add_error_handler(error_handler)
 
-    application.add_error_handler(error_handler)
+# --- Flask app exposed at module level as `app` for the Vercel Python runtime ---
+flask_app = Flask(__name__)
 
-    # Pass webhook settings to telegram
-    await application.bot.set_webhook(url=f"{URL}/telegram", allowed_updates=Update.ALL_TYPES)
 
-    # Set up webserver
-    flask_app = Flask(__name__)
+@flask_app.post("/telegram")
+def telegram() -> Response:
+    """Process one incoming Telegram update synchronously, then return.
 
-    @flask_app.post("/telegram")  # type: ignore[untyped-decorator]
-    async def telegram() -> Response:
-        """Handle incoming Telegram updates by putting them into the `update_queue`"""
-        await application.update_queue.put(Update.de_json(data=request.json, bot=application.bot))
-        return Response(status=HTTPStatus.OK)
+    On serverless there is no long-running worker, so we can't enqueue and walk
+    away. We initialize the application, handle the update in-request, and shut down.
+    """
 
-    @flask_app.route("/submitpayload", methods=["GET", "POST"])  # type: ignore[untyped-decorator]
-    async def custom_updates() -> Response:
-        """
-        Handle incoming webhook updates by also putting them into the `update_queue` if
-        the required parameters were passed correctly.
-        """
-        try:
-            user_id = int(request.args["user_id"])
-            payload = request.args["payload"]
-        except KeyError:
-            abort(
-                HTTPStatus.BAD_REQUEST,
-                "Please pass both `user_id` and `payload` as query parameters.",
-            )
-        except ValueError:
-            abort(HTTPStatus.BAD_REQUEST, "The `user_id` must be a string!")
+    async def _process() -> None:
+        async with application:
+            update = Update.de_json(data=request.get_json(force=True), bot=application.bot)
+            await application.process_update(update)
 
-        await application.update_queue.put(WebhookUpdate(user_id=user_id, payload=payload))
-        return Response(status=HTTPStatus.OK)
+    asyncio.run(_process())
+    return Response(status=HTTPStatus.OK)
 
-    @flask_app.get("/healthcheck")  # type: ignore[untyped-decorator]
-    async def health() -> Response:
-        """For the health endpoint, reply with a simple plain text message."""
-        response = make_response("The bot is still running fine :)", HTTPStatus.OK)
-        response.mimetype = "text/plain"
-        return response
 
-    webserver = uvicorn.Server(
-        config=uvicorn.Config(
-            app=WsgiToAsgi(flask_app),
-            port=PORT,
-            use_colors=False,
-            host="127.0.0.1",
+@flask_app.route("/submitpayload", methods=["GET", "POST"])
+def custom_updates() -> Response:
+    """Handle a custom webhook update synchronously."""
+    try:
+        user_id = int(request.args["user_id"])
+        payload = request.args["payload"]
+    except KeyError:
+        abort(
+            HTTPStatus.BAD_REQUEST,
+            "Please pass both `user_id` and `payload` as query parameters.",
         )
-    )
+    except ValueError:
+        abort(HTTPStatus.BAD_REQUEST, "The `user_id` must be a string!")
 
-    # Run application and webserver together
-    async with application:
-        await application.start()
-        await webserver.serve()
-        await application.stop()
+    async def _process() -> None:
+        async with application:
+            await application.process_update(WebhookUpdate(user_id=user_id, payload=payload))
+
+    asyncio.run(_process())
+    return Response(status=HTTPStatus.OK)
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+@flask_app.route("/setwebhook", methods=["GET", "POST"])
+def set_webhook() -> Response:
+    """One-off endpoint: register this deployment's URL with Telegram.
+
+    Hit this once after deploying (e.g. open it in the browser). The webhook URL
+    is derived from the host this request arrived on, so it works on any deployment.
+    """
+    webhook_url = f"https://{request.host}/telegram"
+
+    async def _set() -> None:
+        async with application:
+            await application.bot.set_webhook(
+                url=webhook_url, allowed_updates=Update.ALL_TYPES
+            )
+
+    asyncio.run(_set())
+    response = make_response(f"Webhook set to {webhook_url}", HTTPStatus.OK)
+    response.mimetype = "text/plain"
+    return response
+
+
+@flask_app.get("/healthcheck")
+def health() -> Response:
+    """For the health endpoint, reply with a simple plain text message."""
+    response = make_response("The bot is still running fine :)", HTTPStatus.OK)
+    response.mimetype = "text/plain"
+    return response
+
+
+# Vercel's Python runtime imports this module and looks for a top-level `app`.
+app = flask_app
