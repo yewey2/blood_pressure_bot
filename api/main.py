@@ -211,16 +211,18 @@ async def webhook_update(update: WebhookUpdate, context: CustomContext) -> None:
 
 
 # --- Build the PTB application at module level so it exists on every cold start ---
+# NB: do NOT name this `app` or `application` — Vercel treats those as the WSGI/ASGI
+# entrypoint and would try to call this PTB object as a web app.
 context_types = ContextTypes(context=CustomContext)
 # updater=None: Telegram delivers updates via webhook, so we don't need an Updater.
-application = (
+ptb_app = (
     Application.builder().token(TOKEN).updater(None).context_types(context_types).build()
 )
 
 # register handlers
-application.add_handler(CommandHandler("start", start))
-application.add_handler(TypeHandler(type=WebhookUpdate, callback=webhook_update))
-application.add_error_handler(error_handler)
+ptb_app.add_handler(CommandHandler("start", start))
+ptb_app.add_handler(TypeHandler(type=WebhookUpdate, callback=webhook_update))
+ptb_app.add_error_handler(error_handler)
 
 # --- Flask app exposed at module level as `app` for the Vercel Python runtime ---
 flask_app = Flask(__name__)
@@ -235,9 +237,9 @@ def telegram() -> Response:
     """
 
     async def _process() -> None:
-        async with application:
-            update = Update.de_json(data=request.get_json(force=True), bot=application.bot)
-            await application.process_update(update)
+        async with ptb_app:
+            update = Update.de_json(data=request.get_json(force=True), bot=ptb_app.bot)
+            await ptb_app.process_update(update)
 
     asyncio.run(_process())
     return Response(status=HTTPStatus.OK)
@@ -258,8 +260,8 @@ def custom_updates() -> Response:
         abort(HTTPStatus.BAD_REQUEST, "The `user_id` must be a string!")
 
     async def _process() -> None:
-        async with application:
-            await application.process_update(WebhookUpdate(user_id=user_id, payload=payload))
+        async with ptb_app:
+            await ptb_app.process_update(WebhookUpdate(user_id=user_id, payload=payload))
 
     asyncio.run(_process())
     return Response(status=HTTPStatus.OK)
@@ -275,8 +277,8 @@ def set_webhook() -> Response:
     webhook_url = f"https://{request.host}/telegram"
 
     async def _set() -> None:
-        async with application:
-            await application.bot.set_webhook(
+        async with ptb_app:
+            await ptb_app.bot.set_webhook(
                 url=webhook_url, allowed_updates=Update.ALL_TYPES
             )
 
