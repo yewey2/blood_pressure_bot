@@ -156,7 +156,7 @@ ONLY provide the full JSON, nothing else, starting with ```json
     img = Image.open(io.BytesIO(image_bytes))
     
     # Use the fast and capable Gemini 1.5 Flash model
-    model = genai.GenerativeModel('gemini-2.5-flash-lite')
+    model = genai.GenerativeModel('gemini-2.5-flash-lite', transport='rest',) # Use REST transport for better compatibility in serverless environments
     
     logger.info("Sending image to Gemini API...")
     try:
@@ -298,6 +298,14 @@ ptb_app.add_handler(MessageHandler(filters.PHOTO, image_handler))
 ptb_app.add_handler(TypeHandler(type=WebhookUpdate, callback=webhook_update))
 ptb_app.add_error_handler(error_handler)
 
+# --- A single event loop reused across warm serverless invocations ---
+# asyncio.run() closes its loop after each call. Since ptb_app is built once at
+# import and its internal asyncio primitives bind to the first loop they run on,
+# a later request in the same warm container would hit "Event loop is closed".
+# Keeping one loop alive (never closed) avoids that.
+_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(_loop)
+
 # --- Flask app exposed at module level as `app` for the Vercel Python runtime ---
 flask_app = Flask(__name__)
 
@@ -315,7 +323,7 @@ def telegram() -> Response:
             update = Update.de_json(data=request.get_json(force=True), bot=ptb_app.bot)
             await ptb_app.process_update(update)
 
-    asyncio.run(_process())
+    _loop.run_until_complete(_process())
     return Response(status=HTTPStatus.OK)
 
 
@@ -337,7 +345,7 @@ def custom_updates() -> Response:
         async with ptb_app:
             await ptb_app.process_update(WebhookUpdate(user_id=user_id, payload=payload))
 
-    asyncio.run(_process())
+    _loop.run_until_complete(_process())
     return Response(status=HTTPStatus.OK)
 
 
@@ -356,7 +364,7 @@ def set_webhook() -> Response:
                 url=webhook_url, allowed_updates=Update.ALL_TYPES
             )
 
-    asyncio.run(_set())
+    _loop.run_until_complete(_set())
     response = make_response(f"Webhook set to {webhook_url}", HTTPStatus.OK)
     response.mimetype = "text/plain"
     return response
