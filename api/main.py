@@ -82,6 +82,7 @@ TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")
 ADMIN_CHAT_ID = TELEGRAM_USER_ID
 TOKEN = TELEGRAM_BOT_TOKEN  # nosec B105
 
+genai.configure(api_key=GEMINI_API_KEY)
 
 @dataclass
 class WebhookUpdate:
@@ -108,15 +109,6 @@ class CustomContext(CallbackContext[ExtBot, dict, dict, dict]):
         return super().from_update(update, application)
 
 
-# async def start(update: Update, context: CustomContext) -> None:
-#     """Display a message with instructions on how to use this bot."""
-#     payload_url = html.escape(f"{URL}/submitpayload?user_id=<your user id>&payload=<payload>")
-#     text = (
-#         f"To check if the bot is still running, call <code>{URL}/healthcheck</code>.\n\n"
-#         f"To post a custom update, call <code>{payload_url}</code>."
-#     )
-#     await update.message.reply_html(text=text)
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for the /start command."""
     await context.bot.send_message(
@@ -124,72 +116,153 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text="Hello! I'm your Blood Pressure reading assistant. Send me a clear picture of your BP monitor's screen."
     )
 
-# async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     """Handler for when the user sends a photo."""
-#     chat_id = update.effective_chat.id
-#     if int(chat_id) != int(TELEGRAM_USER_ID):  # Replace with your Telegram user ID for security
-#         await context.bot.send_message(chat_id=chat_id, text="Sorry, you are not authorized to use this bot.")
-#         return
-    
-#     # Check if the message contains a photo
-#     if not update.message.photo:
-#         await context.bot.send_message(chat_id=chat_id, text="Please send an image file.")
-#         return
+try:
+    # Make sure 'firebase-credentials.json' is in the same folder as your bot script
+    if os.path.exists('firebase-credentials.json'):
+        cred = credentials.Certificate("firebase-credentials.json")
+    else:
+        firebase_creds_json_str = os.getenv("FIREBASE_CREDENTIALS_JSON")    
+        if not firebase_creds_json_str:
+            raise ValueError("FIREBASE_CREDENTIALS_JSON environment variable not set.")
+        firebase_creds_dict = json_repair.loads(firebase_creds_json_str)
+        cred = credentials.Certificate(firebase_creds_dict)
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+    logger.info("✅ Firebase initialized successfully.")
+except Exception as e:
+    logger.error(f"🔥 Error initializing Firebase: {e}. Make sure 'firebase-credentials.json' is present.")
+    db = None # Set db to None if initialization fails
+    raise Exception(f"🔥 Error initializing Firebase: {e}. Make sure 'firebase-credentials.json' is present.")
 
-#     await context.bot.send_message(chat_id=chat_id, text="Processing your image, please wait... 🤖")
-
-#     # Get the photo file sent by the user (we take the highest resolution one)
-#     photo_file = await update.message.photo[-1].get_file()
+# --- Gemini AI Function ---
+async def get_bp_from_image(image_bytes: bytes) -> dict:
+    """Sends an image to Gemini and returns the extracted BP data as a dictionary."""
     
-#     # Download the photo into memory as bytes
-#     photo_bytes = await photo_file.download_as_bytearray()
+    # The prompt is the key to getting reliable results!
+    prompt = """\
+Provide your reply in a JSON format. 
 
-#     # Call our Gemini function to process the image
-#     bp_data = await get_bp_from_image(bytes(photo_bytes))
+The main JSON should have 2 keys: `values` and `status`.
+It should include the systolic blood pressure as `SBP`, diastolic blood pressure as `DBP`, and heart rate as `HR`, as the 3 keys in the values.
+If no values are found, `status` should be `failed`, and values should be null.
+If values are found, `status` should be `success`.
+
+If any of the values are not visible in the image, set them to null.
+
+ONLY provide the full JSON, nothing else, starting with ```json
+    """
     
-#     try:
-#         if bp_data and bp_data.get('status') == "success":
-#             values = bp_data.get('values', {})
-#             sbp = values.get('SBP')
-#             dbp = values.get('DBP')
-#             hr = values.get('HR')
-#             # Ensure all values are present before trying to save
-#             if sbp is not None and dbp is not None and hr is not None:
-#                 # --- SAVE TO FIREBASE ---
-#                 save_successful = save_reading_to_firestore(
-#                     sbp=sbp,
-#                     dbp=dbp,
-#                     hr=hr
-#                 )
-#                 reply_text = (
-#                     f"✅ **Blood Pressure Reading Extracted**\n\n"
-#                     f"🩺 **Systolic (SBP):** {sbp}\n"
-#                     f"❤️ **Diastolic (DBP):** {dbp}\n"
-#                     f"💓 **Heart Rate (HR):** {hr}\n\n"
-#                 )
-#                 if save_successful:
-#                     reply_text += "💾 *Data saved to database.*"
-#                 else:
-#                     reply_text += "⚠️ *Could not save data to database.*"
-#             else:
-#                 sbp_text = sbp if sbp is not None else 'N/A'
-#                 dbp_text = dbp if dbp is not None else 'N/A'
-#                 hr_text = hr if hr is not None else 'N/A'
-#                 reply_text = (
-#                     f"🟡 **Partial Reading Extracted**\n\n"
-#                     f"🩺 **Systolic (SBP):** {sbp_text}\n"
-#                     f"❤️ **Diastolic (DBP):** {dbp_text}\n"
-#                     f"💓 **Heart Rate (HR):** {hr_text}\n\n"
-#                     f"💾 *Not saved to database because some values are missing.*"
-#                 )
-#         elif bp_data and bp_data.get('status' == "failed"):
-#             reply_text = f"Sorry, I couldn't read the values. Please try a clearer picture."
-#         else:
-#             reply_text = f"Sorry, something went wrong. Data is {bp_data}"
-#     except Exception as e:
-#         reply_text = f"Error encountered:\n\n{traceback.format_exc()}"
-#     finally:
-#         await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode="Markdown")
+    # Use Pillow to open the image from bytes
+    img = Image.open(io.BytesIO(image_bytes))
+    
+    # Use the fast and capable Gemini 1.5 Flash model
+    model = genai.GenerativeModel('gemini-2.5-flash-lite')
+    
+    logger.info("Sending image to Gemini API...")
+    try:
+        response = await model.generate_content_async([prompt, img])
+        
+        # Clean up the response to get pure JSON
+        cleaned_text = response.text.strip().replace("```json", "").replace("```", "")
+        logger.info(f"Received raw response: {cleaned_text}")
+        
+        # Parse the JSON string into a Python dictionary
+        data = json_repair.loads(cleaned_text) ## Use json repair in case anything wrong with the json.
+        return data
+
+    except Exception as e:
+        logger.error(f"Error processing image with Gemini: {e}")
+        return {"error": "Could not process the image or parse the response."}
+
+# --- NEW FIREBASE FUNCTION ---
+def save_reading_to_firestore(sbp: int, dbp: int, hr: int):
+    """Saves a new blood pressure reading to the Firestore database."""
+    if not db:
+        logger.error("Firestore client not available. Skipping save.")
+        return False
+    
+    try:
+        # Create a new document in the 'readings' collection
+        doc_ref = db.collection('readings').document()
+        doc_ref.set({
+            'timestamp': datetime.now(pytz.timezone('Asia/Singapore')), # Use current server time
+            'sbp': int(sbp),
+            'dbp': int(dbp),
+            'hr': int(hr)
+        })
+        logger.info(f"Successfully saved reading to Firestore.")
+        return True
+    except Exception as e:
+        logger.error(f"Error saving to Firestore: {e}")
+        return False
+
+
+async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for when the user sends a photo."""
+    chat_id = update.effective_chat.id
+    if int(chat_id) != int(TELEGRAM_USER_ID):  # Replace with your Telegram user ID for security
+        await context.bot.send_message(chat_id=chat_id, text="Sorry, you are not authorized to use this bot.")
+        return
+    
+    # Check if the message contains a photo
+    if not update.message.photo:
+        await context.bot.send_message(chat_id=chat_id, text="Please send an image file.")
+        return
+
+    await context.bot.send_message(chat_id=chat_id, text="Processing your image, please wait... 🤖")
+
+    # Get the photo file sent by the user (we take the highest resolution one)
+    photo_file = await update.message.photo[-1].get_file()
+    
+    # Download the photo into memory as bytes
+    photo_bytes = await photo_file.download_as_bytearray()
+
+    # Call our Gemini function to process the image
+    bp_data = await get_bp_from_image(bytes(photo_bytes))
+    
+    try:
+        if bp_data and bp_data.get('status') == "success":
+            values = bp_data.get('values', {})
+            sbp = values.get('SBP')
+            dbp = values.get('DBP')
+            hr = values.get('HR')
+            # Ensure all values are present before trying to save
+            if sbp is not None and dbp is not None and hr is not None:
+                # --- SAVE TO FIREBASE ---
+                save_successful = save_reading_to_firestore(
+                    sbp=sbp,
+                    dbp=dbp,
+                    hr=hr
+                )
+                reply_text = (
+                    f"✅ **Blood Pressure Reading Extracted**\n\n"
+                    f"🩺 **Systolic (SBP):** {sbp}\n"
+                    f"❤️ **Diastolic (DBP):** {dbp}\n"
+                    f"💓 **Heart Rate (HR):** {hr}\n\n"
+                )
+                if save_successful:
+                    reply_text += "💾 *Data saved to database.*"
+                else:
+                    reply_text += "⚠️ *Could not save data to database.*"
+            else:
+                sbp_text = sbp if sbp is not None else 'N/A'
+                dbp_text = dbp if dbp is not None else 'N/A'
+                hr_text = hr if hr is not None else 'N/A'
+                reply_text = (
+                    f"🟡 **Partial Reading Extracted**\n\n"
+                    f"🩺 **Systolic (SBP):** {sbp_text}\n"
+                    f"❤️ **Diastolic (DBP):** {dbp_text}\n"
+                    f"💓 **Heart Rate (HR):** {hr_text}\n\n"
+                    f"💾 *Not saved to database because some values are missing.*"
+                )
+        elif bp_data and bp_data.get('status' == "failed"):
+            reply_text = f"Sorry, I couldn't read the values. Please try a clearer picture."
+        else:
+            reply_text = f"Sorry, something went wrong. Data is {bp_data}"
+    except Exception as e:
+        reply_text = f"Error encountered:\n\n{traceback.format_exc()}"
+    finally:
+        await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode="Markdown")
     
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -221,6 +294,7 @@ ptb_app = (
 
 # register handlers
 ptb_app.add_handler(CommandHandler("start", start))
+ptb_app.add_handler(MessageHandler(filters.PHOTO, image_handler))
 ptb_app.add_handler(TypeHandler(type=WebhookUpdate, callback=webhook_update))
 ptb_app.add_error_handler(error_handler)
 
