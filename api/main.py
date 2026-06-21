@@ -82,7 +82,8 @@ TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")
 ADMIN_CHAT_ID = TELEGRAM_USER_ID
 TOKEN = TELEGRAM_BOT_TOKEN  # nosec B105
 
-genai.configure(api_key=GEMINI_API_KEY)
+# genai.configure(api_key=GEMINI_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY, transport="rest")
 
 @dataclass
 class WebhookUpdate:
@@ -156,7 +157,7 @@ ONLY provide the full JSON, nothing else, starting with ```json
     img = Image.open(io.BytesIO(image_bytes))
     
     # Use the fast and capable Gemini 1.5 Flash model
-    model = genai.GenerativeModel('gemini-2.5-flash-lite', transport='rest',) # Use REST transport for better compatibility in serverless environments
+    model = genai.GenerativeModel('gemini-2.5-flash-lite')
     
     logger.info("Sending image to Gemini API...")
     try:
