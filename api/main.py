@@ -278,7 +278,8 @@ ONLY provide the full JSON, nothing else, starting with ```json
     
     logger.info("Sending image to Gemini API...")
     try:
-        response = await model.generate_content_async([prompt, img])
+        # response = await model.generate_content_async([prompt, img])
+        response = await asyncio.to_thread(model.generate_content, [prompt, img])
         
         # Clean up the response to get pure JSON
         cleaned_text = response.text.strip().replace("```json", "").replace("```", "")
