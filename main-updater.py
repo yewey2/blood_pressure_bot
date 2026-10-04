@@ -1,4 +1,5 @@
 import os
+import asyncio
 import logging
 import io
 import json
@@ -7,7 +8,7 @@ import json
 import json_repair
 import traceback
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import urlencode
 from urllib.request import urlopen
 
 # Use python-dotenv to load environment variables from a .env file for local development
@@ -130,12 +131,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def get_singapore_psi() -> dict:
-    """Fetch current Singapore-wide air quality data from AQICN."""
+def _aqicn_request(path: str, params: dict | None = None) -> dict:
     if not AQICN_API_KEY:
         raise RuntimeError("AQICN_API_KEY is not configured.")
-
-    url = f"https://api.waqi.info/feed/Singapore/?token={quote(AQICN_API_KEY)}"
+    query = {"token": AQICN_API_KEY, **(params or {})}
+    url = f"https://api.waqi.info/{path}?{urlencode(query)}"
     with urlopen(url, timeout=15) as response:
         payload = json.loads(response.read().decode("utf-8"))
     if payload.get("status") != "ok":
@@ -143,45 +143,104 @@ def get_singapore_psi() -> dict:
     return payload["data"]
 
 
+def get_singapore_psi() -> tuple[dict, list[dict]]:
+    """Fetch the Singapore feed and each Singapore station's AQICN feed."""
+    general = _aqicn_request("feed/Singapore/")
+    # Singapore island bounding box keeps the map response limited to local stations.
+    stations_data = _aqicn_request("map/bounds/", {"latlng": "1.15,103.6,1.48,104.1"})
+    stations = {}
+    for station in stations_data if isinstance(stations_data, list) else []:
+        uid = station.get("uid")
+        if uid is not None:
+            stations[uid] = station
+
+    def fetch_station(station):
+        try:
+            return _aqicn_request(f"feed/@{station['uid']}/")
+        except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError) as exc:
+            logger.info("Unable to fetch AQICN station %s: %s", station.get("uid"), exc)
+            return None
+
+    # Keep stations inside Singapore's island bounding box and exclude nearby
+    # Johor stations that can also appear near the map boundary.
+    candidates = []
+    for station in stations.values():
+        geo = station.get("lat"), station.get("lon")
+        try:
+            lat, lon = map(float, geo)
+        except (TypeError, ValueError):
+            continue
+        if 1.15 <= lat <= 1.48 and 103.6 <= lon <= 104.1:
+            candidates.append(station)
+    results = fetch_station_feeds(candidates, fetch_station)
+    return general, results
+
+
+def fetch_station_feeds(stations, fetch_station):
+    """Fetch station feeds concurrently while keeping the caller synchronous."""
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        feeds = list(pool.map(fetch_station, stations))
+    results = []
+    for station, feed in zip(stations, feeds):
+        if not feed:
+            # Include listed Singapore sites even when their live feed is unavailable.
+            results.append({"station": station.get("station", {}).get("name", "Singapore station"), "aqi": "N/A", "iaqi": {}, "time": {}})
+            continue
+        results.append({
+            "station": feed.get("city", {}).get("name", station.get("station", {}).get("name", "Singapore station")),
+            "aqi": feed.get("aqi", "N/A"),
+            "iaqi": feed.get("iaqi") or {},
+            "time": feed.get("time") or {},
+        })
+    return results
+
+
 async def psi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Report Singapore PSI and all AQI/IAQI fields available from AQICN."""
+    """Report general Singapore and station readings for AQI, PM10 and PM2.5."""
     if not AQICN_API_KEY:
         await update.effective_message.reply_text("AQICN_API_KEY is not configured.")
         return
 
     try:
-        data = await asyncio.to_thread(get_singapore_psi)
+        general, stations = await asyncio.to_thread(get_singapore_psi)
     except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError) as exc:
         logger.warning("AQICN request failed: %s", exc)
         await update.effective_message.reply_text("Could not fetch Singapore PSI right now. Please try again later.")
         return
 
-    aqi = data.get("aqi", "N/A")
-    iaqi = data.get("iaqi") or {}
-    lines = [f"Singapore air quality (AQICN): PSI/AQI {aqi}"]
+    def value(feed, key):
+        entry = (feed.get("iaqi") or {}).get(key)
+        return entry.get("v", "N/A") if isinstance(entry, dict) else "N/A"
 
-    # AQICN reports particulate/gas concentrations and additional index metrics
-    # under iaqi. Include every returned field so the user sees available data.
-    if iaqi:
-        lines.append("Available breakdown:")
-        for key, item in iaqi.items():
-            value = item.get("v", "N/A") if isinstance(item, dict) else item
-            label = {
-                "pm25": "PM2.5", "pm10": "PM10", "o3": "O₃", "no2": "NO₂",
-                "so2": "SO₂", "co": "CO", "t": "Temperature", "h": "Humidity",
-                "p": "Pressure", "w": "Wind", "wg": "Wind gust",
-            }.get(key, key.upper())
-            lines.append(f"• {label}: {value}")
-    else:
-        lines.append("No pollutant breakdown is currently available.")
-
-    station = data.get("city", {}).get("name")
-    if station:
-        lines.append(f"Source: {station}")
-    timestamp = data.get("time", {}).get("s")
-    if timestamp:
-        lines.append(f"Updated: {timestamp}")
-    await update.effective_message.reply_text("\n".join(lines))
+    lines = ["Singapore — general", f"AQI/PSI: {general.get('aqi', 'N/A')}",
+             f"PM10: {value(general, 'pm10')}", f"PM2.5: {value(general, 'pm25')}"]
+    if general.get("time", {}).get("s"):
+        lines.append(f"Updated: {general['time']['s']}")
+    lines.append("\nSingapore stations")
+    if not stations:
+        lines.append("No station feeds available.")
+    for station in stations:
+        lines.extend([
+            f"\n{station['station']}",
+            f"AQI: {station['aqi']} | PM10: {value(station, 'pm10')} | PM2.5: {value(station, 'pm25')}",
+        ])
+        if station.get("time", {}).get("s"):
+            lines.append(f"Updated: {station['time']['s']}")
+    # Telegram limits each text message to 4096 characters.
+    chunks = []
+    chunk = ""
+    for line in lines:
+        addition = ("\n" if chunk else "") + line
+        if len(chunk) + len(addition) > 3900:
+            chunks.append(chunk)
+            chunk = line
+        else:
+            chunk += addition
+    if chunk:
+        chunks.append(chunk)
+    for chunk in chunks:
+        await update.effective_message.reply_text(chunk)
 
 async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for when the user sends a photo."""
