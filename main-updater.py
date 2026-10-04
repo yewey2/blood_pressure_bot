@@ -6,6 +6,9 @@ from PIL import Image
 import json
 import json_repair
 import traceback
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import urlopen
 
 # Use python-dotenv to load environment variables from a .env file for local development
 # In production (like on Render), you will set these directly.
@@ -26,6 +29,7 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Messa
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")
+AQICN_API_KEY = os.getenv("AQICN_API_KEY")
 
 # Configure the Gemini API client
 genai.configure(api_key=GEMINI_API_KEY)
@@ -125,6 +129,60 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text="Hello! I'm your Blood Pressure reading assistant. Send me a clear picture of your BP monitor's screen."
     )
 
+
+def get_singapore_psi() -> dict:
+    """Fetch current Singapore-wide air quality data from AQICN."""
+    if not AQICN_API_KEY:
+        raise RuntimeError("AQICN_API_KEY is not configured.")
+
+    url = f"https://api.waqi.info/feed/Singapore/?token={quote(AQICN_API_KEY)}"
+    with urlopen(url, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if payload.get("status") != "ok":
+        raise RuntimeError(payload.get("data", "AQICN returned an unexpected response."))
+    return payload["data"]
+
+
+async def psi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Report Singapore PSI and all AQI/IAQI fields available from AQICN."""
+    if not AQICN_API_KEY:
+        await update.effective_message.reply_text("AQICN_API_KEY is not configured.")
+        return
+
+    try:
+        data = await asyncio.to_thread(get_singapore_psi)
+    except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError) as exc:
+        logger.warning("AQICN request failed: %s", exc)
+        await update.effective_message.reply_text("Could not fetch Singapore PSI right now. Please try again later.")
+        return
+
+    aqi = data.get("aqi", "N/A")
+    iaqi = data.get("iaqi") or {}
+    lines = [f"Singapore air quality (AQICN): PSI/AQI {aqi}"]
+
+    # AQICN reports particulate/gas concentrations and additional index metrics
+    # under iaqi. Include every returned field so the user sees available data.
+    if iaqi:
+        lines.append("Available breakdown:")
+        for key, item in iaqi.items():
+            value = item.get("v", "N/A") if isinstance(item, dict) else item
+            label = {
+                "pm25": "PM2.5", "pm10": "PM10", "o3": "O₃", "no2": "NO₂",
+                "so2": "SO₂", "co": "CO", "t": "Temperature", "h": "Humidity",
+                "p": "Pressure", "w": "Wind", "wg": "Wind gust",
+            }.get(key, key.upper())
+            lines.append(f"• {label}: {value}")
+    else:
+        lines.append("No pollutant breakdown is currently available.")
+
+    station = data.get("city", {}).get("name")
+    if station:
+        lines.append(f"Source: {station}")
+    timestamp = data.get("time", {}).get("s")
+    if timestamp:
+        lines.append(f"Updated: {timestamp}")
+    await update.effective_message.reply_text("\n".join(lines))
+
 async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for when the user sends a photo."""
     chat_id = update.effective_chat.id
@@ -208,6 +266,7 @@ if __name__ == '__main__':
     
     # Add handlers
     application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('psi', psi))
     application.add_handler(MessageHandler(filters.PHOTO, image_handler))
     
     # Add error handler
