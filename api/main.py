@@ -15,14 +15,17 @@ Press Ctrl-C on the command line or send a signal to the process to stop the bot
 """
 
 import asyncio
+import base64
+import binascii
 import html
 import logging
+import re
 from dataclasses import dataclass
 from http import HTTPStatus
 
 from flask import Flask, Response, abort, make_response, request
 
-from telegram import Update
+from telegram import InputMediaPhoto, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -59,7 +62,7 @@ import json_repair
 import traceback
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 # Use python-dotenv to load environment variables from a .env file for local development
 # In production (like on Render), you will set these directly.
@@ -124,6 +127,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _aqicn_request(path: str, params: dict | None = None) -> dict:
+    """Fetch one AQICN JSON feed using this bot's private API token."""
     if not AQICN_API_KEY:
         raise RuntimeError("AQICN_API_KEY is not configured.")
     query = {"token": AQICN_API_KEY, **(params or {})}
@@ -135,61 +139,124 @@ def _aqicn_request(path: str, params: dict | None = None) -> dict:
     return payload["data"]
 
 
-def get_singapore_psi() -> tuple[dict, list[dict]]:
-    """Fetch the Singapore feed and each Singapore station's AQICN feed."""
-    general = _aqicn_request("feed/Singapore/")
-    # Singapore island bounding box keeps the map response limited to local stations.
-    stations_data = _aqicn_request("map/bounds/", {"latlng": "1.15,103.6,1.48,104.1"})
-    stations = {}
-    for station in stations_data if isinstance(stations_data, list) else []:
-        uid = station.get("uid")
-        if uid is not None:
-            stations[uid] = station
+SINGAPORE_REGIONS = ("North", "South", "East", "West", "Central")
+AQICN_CITY_PAGES = {
+    region: f"https://aqicn.org/city/singapore/{region.lower()}/"
+    for region in SINGAPORE_REGIONS
+}
 
-    def fetch_station(station):
+
+def _parallel_fetch(items, fetch, max_workers: int = 6):
+    """Run independent, blocking AQICN requests concurrently."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(items) or 1)) as pool:
+        return list(pool.map(fetch, items))
+
+
+def get_singapore_psi() -> tuple[dict, list[dict]]:
+    """Fetch Singapore-wide and the five NEA regional AQICN feeds only.
+
+    AQICN's map bounds endpoint can include Johor stations. The named feeds
+    below intentionally avoid map discovery: they are the five Singapore
+    regions the bot reports and averages.
+    """
+    def fetch_feed(feed_name: str):
         try:
-            return _aqicn_request(f"feed/@{station['uid']}/")
+            return _aqicn_request(f"feed/{feed_name}/")
         except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError) as exc:
-            logger.info("Unable to fetch AQICN station %s: %s", station.get("uid"), exc)
+            logger.info("Unable to fetch AQICN feed %s: %s", feed_name, exc)
             return None
 
-    # Keep stations inside Singapore's island bounding box and exclude nearby
-    # Johor stations that can also appear near the map boundary.
-    candidates = []
-    for station in stations.values():
-        geo = station.get("lat"), station.get("lon")
-        try:
-            lat, lon = map(float, geo)
-        except (TypeError, ValueError):
-            continue
-        if 1.15 <= lat <= 1.48 and 103.6 <= lon <= 104.1:
-            candidates.append(station)
-    results = fetch_station_feeds(candidates, fetch_station)
-    return general, results
+    feed_names = ["Singapore", *[f"Singapore/{region}" for region in SINGAPORE_REGIONS]]
+    feeds = _parallel_fetch(feed_names, fetch_feed)
+    general = feeds[0]
+    if not general:
+        raise RuntimeError("The Singapore-wide AQICN feed is unavailable.")
+
+    regions = []
+    for region, feed in zip(SINGAPORE_REGIONS, feeds[1:]):
+        regions.append(_compact_aqicn_feed(region, feed))
+    return general, regions
 
 
-def fetch_station_feeds(stations, fetch_station):
-    """Fetch station feeds concurrently while keeping the caller synchronous."""
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        feeds = list(pool.map(fetch_station, stations))
-    results = []
-    for station, feed in zip(stations, feeds):
-        if not feed:
-            # Include listed Singapore sites even when their live feed is unavailable.
-            results.append({"station": station.get("station", {}).get("name", "Singapore station"), "aqi": "N/A", "iaqi": {}, "time": {}})
-            continue
-        results.append({
-            "station": feed.get("city", {}).get("name", station.get("station", {}).get("name", "Singapore station")),
-            "aqi": feed.get("aqi", "N/A"),
-            "iaqi": feed.get("iaqi") or {},
-            "time": feed.get("time") or {},
-        })
-    return results
+def _compact_aqicn_feed(region: str, feed: dict | None) -> dict:
+    """Keep the fields needed by the PM display and preserve missing regions."""
+    if not feed:
+        return {"region": region, "aqi": None, "iaqi": {}, "time": {}}
+    return {
+        "region": region,
+        "aqi": feed.get("aqi"),
+        "iaqi": feed.get("iaqi") or {},
+        "time": feed.get("time") or {},
+        "city": feed.get("city") or {},
+    }
+
+
+def _pollutant_aqi(feed: dict, pollutant: str):
+    """Return AQICN's pollutant-specific AQI, or None when it is unavailable."""
+    entry = (feed.get("iaqi") or {}).get(pollutant)
+    return entry.get("v") if isinstance(entry, dict) else None
+
+
+def _number(value) -> float | None:
+    """Safely coerce AQICN's numeric fields, excluding non-finite values."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None
+
+
+def _mean(values) -> float | None:
+    numeric_values = [number for value in values if (number := _number(value)) is not None]
+    return sum(numeric_values) / len(numeric_values) if numeric_values else None
+
+
+def _display_number(value) -> str:
+    number = _number(value)
+    if number is None:
+        return "N/A"
+    return str(round(number)) if number.is_integer() else f"{number:.1f}"
+
+
+def _aqi_label(value) -> str:
+    number = _number(value)
+    if number is None:
+        return "Unavailable"
+    if number <= 50:
+        return "Good"
+    if number <= 100:
+        return "Moderate"
+    if number <= 150:
+        return "Unhealthy for sensitive groups"
+    if number <= 200:
+        return "Unhealthy"
+    if number <= 300:
+        return "Very unhealthy"
+    return "Hazardous"
+
+
+def _format_pm_values(feed: dict) -> str:
+    """PM values are AQI sub-indices, never misleading mass concentrations."""
+    return (
+        f"PM2.5 AQI {_display_number(_pollutant_aqi(feed, 'pm25'))}"
+        f" | PM10 AQI {_display_number(_pollutant_aqi(feed, 'pm10'))}"
+    )
+
+
+def _format_difference(general_value, regional_mean) -> str:
+    general_number = _number(general_value)
+    average_number = _number(regional_mean)
+    if general_number is None or average_number is None:
+        return "N/A"
+    difference = general_number - average_number
+    sign = "+" if difference > 0 else ""
+    return f"{sign}{_display_number(difference)}"
 
 
 async def psi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Report general Singapore and station readings for AQI, PM10 and PM2.5."""
+    """Report PM2.5 and PM10 AQI for the five Singapore regions."""
     if not AQICN_API_KEY:
         await update.effective_message.reply_text("AQICN_API_KEY is not configured.")
         return
@@ -198,41 +265,186 @@ async def psi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         general, stations = await asyncio.to_thread(get_singapore_psi)
     except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError) as exc:
         logger.warning("AQICN request failed: %s", exc)
-        await update.effective_message.reply_text("Could not fetch Singapore PSI right now. Please try again later.")
+        await update.effective_message.reply_text(
+            "Could not fetch Singapore PM readings from AQICN right now. Please try again later."
+        )
         return
 
-    def value(feed, key):
-        entry = (feed.get("iaqi") or {}).get(key)
-        return entry.get("v", "N/A") if isinstance(entry, dict) else "N/A"
+    regional_aqi_mean = _mean(station.get("aqi") for station in stations)
+    regional_pm25_mean = _mean(_pollutant_aqi(station, "pm25") for station in stations)
+    regional_pm10_mean = _mean(_pollutant_aqi(station, "pm10") for station in stations)
+    available_regions = sum(_number(station.get("aqi")) is not None for station in stations)
 
-    lines = ["Singapore — general", f"AQI/PSI: {general.get('aqi', 'N/A')}",
-             f"PM10: {value(general, 'pm10')}", f"PM2.5: {value(general, 'pm25')}"]
+    lines = [
+        "<b>Singapore particulate air quality</b>",
+        "AQICN 1-hour AQI view • PM2.5 and PM10 only",
+        "",
+        f"<b>Five-region mean</b> ({available_regions}/5 reporting)",
+        f"AQI {_display_number(regional_aqi_mean)} ({_aqi_label(regional_aqi_mean)})",
+        (
+            f"PM2.5 AQI {_display_number(regional_pm25_mean)}"
+            f" | PM10 AQI {_display_number(regional_pm10_mean)}"
+        ),
+        "",
+        "<b>Singapore-wide AQICN feed</b>",
+        f"AQI {_display_number(general.get('aqi'))} ({_aqi_label(general.get('aqi'))})",
+        _format_pm_values(general),
+        f"Difference from five-region mean: {_format_difference(general.get('aqi'), regional_aqi_mean)} AQI",
+    ]
     if general.get("time", {}).get("s"):
-        lines.append(f"Updated: {general['time']['s']}")
-    lines.append("\nSingapore stations")
-    if not stations:
-        lines.append("No station feeds available.")
+        lines.append(f"Updated: {html.escape(str(general['time']['s']))}")
+
+    lines.extend(["", "<b>Regional AQI readings</b>"])
     for station in stations:
-        lines.extend([
-            f"\n{station['station']}",
-            f"AQI: {station['aqi']} | PM10: {value(station, 'pm10')} | PM2.5: {value(station, 'pm25')}",
-        ])
-        if station.get("time", {}).get("s"):
-            lines.append(f"Updated: {station['time']['s']}")
-    # Telegram limits each text message to 4096 characters.
-    chunks = []
-    chunk = ""
-    for line in lines:
-        addition = ("\n" if chunk else "") + line
-        if len(chunk) + len(addition) > 3900:
-            chunks.append(chunk)
-            chunk = line
-        else:
-            chunk += addition
-    if chunk:
-        chunks.append(chunk)
-    for chunk in chunks:
-        await update.effective_message.reply_text(chunk)
+        lines.append(
+            f"<b>{html.escape(station['region'])}</b>: "
+            f"AQI {_display_number(station.get('aqi'))} ({_aqi_label(station.get('aqi'))})"
+        )
+        lines.append(_format_pm_values(station))
+
+    lines.extend([
+        "",
+        "PM2.5 and PM10 are pollutant-specific AQI values (not µg/m³). "
+        "AQI 100 is the top of the Moderate band; 101 begins Unhealthy for Sensitive Groups.",
+        "Source: Singapore NEA data as presented by World Air Quality Index (AQICN). /psigraph sends the regional trends.",
+    ])
+    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+def _aqicn_city_page(url: str) -> str:
+    """Read a public AQICN city page, which contains its native PM graphs."""
+    request_headers = {"User-Agent": "Mozilla/5.0 (compatible; BloodPressureBot/1.0)"}
+    with urlopen(Request(url, headers=request_headers), timeout=20) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+_AQICN_GRAPH_PATTERN = re.compile(
+    r"<td\s+id=['\"]td_(pm25|pm10)['\"][^>]*>.*?"
+    r"<img[^>]+src=['\"]data:image/png;base64,([A-Za-z0-9+/=\s]+)['\"]",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _extract_pm_graphs(page: str) -> dict[str, bytes]:
+    """Extract AQICN's embedded PM2.5/PM10 sparklines from a city page."""
+    graphs = {}
+    for match in _AQICN_GRAPH_PATTERN.finditer(page):
+        pollutant = match.group(1).lower()
+        try:
+            graphs[pollutant] = base64.b64decode(
+                re.sub(r"\s+", "", match.group(2)), validate=True
+            )
+        except (binascii.Error, ValueError):
+            logger.warning("AQICN returned an invalid %s graph image.", pollutant)
+    return graphs
+
+
+def _latest_24h_graph(image: Image.Image) -> Image.Image:
+    """AQICN's native trend spans two days; retain its newest (right-hand) day."""
+    split = max(0, image.width // 2 - 1)
+    return image.crop((split, 0, image.width, image.height)).copy()
+
+
+def _build_region_graph(region: str, graph_bytes: dict[str, bytes]) -> bytes:
+    """Make one readable Telegram image containing the two particulate charts."""
+    charts = []
+    for pollutant in ("pm25", "pm10"):
+        raw_image = graph_bytes.get(pollutant)
+        if not raw_image:
+            continue
+        with Image.open(io.BytesIO(raw_image)) as image:
+            chart = _latest_24h_graph(image.convert("RGB"))
+            charts.append((pollutant, chart.resize((chart.width * 3, chart.height * 3))))
+    if not charts:
+        raise ValueError(f"AQICN supplied no PM graphs for {region}.")
+
+    from PIL import ImageDraw, ImageFont
+
+    width = max(chart.width for _, chart in charts) + 40
+    height = 88 + sum(chart.height + 42 for _, chart in charts) + 28
+    canvas = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(canvas)
+    bold_font = ImageFont.load_default()
+    draw.rectangle((0, 0, width, 58), fill="#138fcc")
+    draw.text((20, 13), f"{region}, Singapore - latest 24 hours", fill="white", font=bold_font)
+    draw.text((20, 70), "AQICN two-day trend cropped to its latest 24-hour half", fill="#555555")
+    y_position = 94
+    labels = {"pm25": "PM2.5 AQI", "pm10": "PM10 AQI"}
+    for pollutant, chart in charts:
+        draw.text((20, y_position), labels[pollutant], fill="#222222", font=bold_font)
+        y_position += 18
+        canvas.paste(chart, (20, y_position))
+        y_position += chart.height + 24
+    draw.text((20, height - 20), "Source: World Air Quality Index (AQICN) / Singapore NEA", fill="#555555")
+
+    output = io.BytesIO()
+    canvas.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+def get_singapore_pm_graphs() -> list[tuple[str, bytes]]:
+    """Build one ephemeral 24-hour PM graph per named Singapore region."""
+    def fetch_region(region: str):
+        try:
+            return region, _extract_pm_graphs(_aqicn_city_page(AQICN_CITY_PAGES[region]))
+        except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+            logger.info("Unable to fetch AQICN graph for %s: %s", region, exc)
+            return region, {}
+
+    graph_sets = _parallel_fetch(list(SINGAPORE_REGIONS), fetch_region, max_workers=5)
+    graphs = []
+    for region, graph_bytes in graph_sets:
+        try:
+            graphs.append((region, _build_region_graph(region, graph_bytes)))
+        except (ValueError, OSError) as exc:
+            logger.info("Unable to build AQICN graph for %s: %s", region, exc)
+    return graphs
+
+
+async def psigraph(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send native AQICN-based 24-hour PM trend images for all five regions."""
+    try:
+        graphs = await asyncio.to_thread(get_singapore_pm_graphs)
+    except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+        logger.warning("AQICN graph request failed: %s", exc)
+        await update.effective_message.reply_text(
+            "Could not fetch AQICN's PM trend graphs right now. Please try again later."
+        )
+        return
+
+    if not graphs:
+        await update.effective_message.reply_text(
+            "AQICN did not provide usable PM2.5/PM10 graph images right now. Please try again later."
+        )
+        return
+
+    caption = (
+        "<b>Singapore PM trend graphs</b>\n"
+        "PM2.5 and PM10 AQI only. Each image is the latest 24-hour half of AQICN's native two-day trend. "
+        "Source: Singapore NEA via World Air Quality Index (AQICN)."
+    )
+    if len(graphs) == 1:
+        region, image_bytes = graphs[0]
+        image_file = io.BytesIO(image_bytes)
+        image_file.name = f"singapore-{region.lower()}-pm-24h.png"
+        await update.effective_message.reply_photo(
+            photo=image_file, caption=caption, parse_mode=ParseMode.HTML
+        )
+        return
+
+    media = []
+    for index, (region, image_bytes) in enumerate(graphs):
+        image_file = io.BytesIO(image_bytes)
+        image_file.name = f"singapore-{region.lower()}-pm-24h.png"
+        media.append(
+            InputMediaPhoto(
+                media=image_file,
+                caption=caption if index == 0 else None,
+                parse_mode=ParseMode.HTML if index == 0 else None,
+            )
+        )
+    await update.effective_message.reply_media_group(media=media)
+
 
 try:
     # Make sure 'firebase-credentials.json' is in the same folder as your bot script
@@ -414,6 +626,7 @@ ptb_app = (
 # register handlers
 ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(CommandHandler("psi", psi))
+ptb_app.add_handler(CommandHandler("psigraph", psigraph))
 ptb_app.add_handler(MessageHandler(filters.PHOTO, image_handler))
 ptb_app.add_handler(TypeHandler(type=WebhookUpdate, callback=webhook_update))
 ptb_app.add_error_handler(error_handler)
