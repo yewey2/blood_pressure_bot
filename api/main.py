@@ -240,8 +240,8 @@ def _aqi_label(value) -> str:
 def _format_pm_values(feed: dict) -> str:
     """PM values are AQI sub-indices, never misleading mass concentrations."""
     return (
-        f"PM2.5 AQI {_display_number(_pollutant_aqi(feed, 'pm25'))}"
-        f" | PM10 AQI {_display_number(_pollutant_aqi(feed, 'pm10'))}"
+        f"PM2.5: {_display_number(_pollutant_aqi(feed, 'pm25'))}\n"
+        f"PM10: {_display_number(_pollutant_aqi(feed, 'pm10'))}\n"
     )
 
 
@@ -277,37 +277,35 @@ async def psi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [
         "<b>Singapore particulate air quality</b>",
-        "AQICN 1-hour AQI view • PM2.5 and PM10 only",
+        # "AQICN 1-hour AQI view • PM2.5 and PM10 only",
         "",
         f"<b>Five-region mean</b> ({available_regions}/5 reporting)",
-        f"AQI {_display_number(regional_aqi_mean)} ({_aqi_label(regional_aqi_mean)})",
-        (
-            f"PM2.5 AQI {_display_number(regional_pm25_mean)}"
-            f" | PM10 AQI {_display_number(regional_pm10_mean)}"
-        ),
+        f"AQI {_display_number(regional_aqi_mean)} --- ({_aqi_label(regional_aqi_mean)})",
+        f"PM2.5: {_display_number(regional_pm25_mean)}",
+        f"PM10: {_display_number(regional_pm10_mean)}",
         "",
         "<b>Singapore-wide AQICN feed</b>",
-        f"AQI {_display_number(general.get('aqi'))} ({_aqi_label(general.get('aqi'))})",
+        f"AQI {_display_number(general.get('aqi'))} --- ({_aqi_label(general.get('aqi'))})",
         _format_pm_values(general),
         f"Difference from five-region mean: {_format_difference(general.get('aqi'), regional_aqi_mean)} AQI",
     ]
-    if general.get("time", {}).get("s"):
-        lines.append(f"Updated: {html.escape(str(general['time']['s']))}")
 
     lines.extend(["", "<b>Regional AQI readings</b>"])
     for station in stations:
         lines.append(
-            f"<b>{html.escape(station['region'])}</b>: "
+            f"<b>{html.escape(station['region'])}</b>: \n"
             f"AQI {_display_number(station.get('aqi'))} ({_aqi_label(station.get('aqi'))})"
         )
         lines.append(_format_pm_values(station))
 
-    lines.extend([
-        "",
-        "PM2.5 and PM10 are pollutant-specific AQI values (not µg/m³). "
-        "AQI 100 is the top of the Moderate band; 101 begins Unhealthy for Sensitive Groups.",
-        "Source: Singapore NEA data as presented by World Air Quality Index (AQICN). /psigraph sends the regional trends.",
-    ])
+    if general.get("time", {}).get("s"):
+        lines.append(f"Updated: {html.escape(str(general['time']['s']))}")
+    # lines.extend([
+    #     "",
+    #     "PM2.5 and PM10 are pollutant-specific AQI values (not µg/m³). "
+    #     "AQI 100 is the top of the Moderate band; 101 begins Unhealthy for Sensitive Groups.",
+    #     "Source: Singapore NEA data as presented by World Air Quality Index (AQICN). /psigraph sends the regional trends.",
+    # ])
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
