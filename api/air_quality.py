@@ -145,17 +145,97 @@ def get_latest_nea_psi() -> dict:
 
 
 
+def _fetch_nea_pm25_day(day: str) -> list[dict]:
+    """Fetch all published one-hour PM2.5 readings for one Singapore day."""
+    records = []
+    page_token = None
+    seen_tokens = set()
+    while True:
+        params = {"date": day}
+        if page_token:
+            params["paginationToken"] = page_token
+        request = Request(
+            f"{_NEA_PM25_API}?{urlencode(params)}",
+            headers={"User-Agent": "BloodPressureBot/1.0"},
+        )
+        with urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if payload.get("code") != 0:
+            raise RuntimeError(payload.get("errorMsg") or "NEA PM2.5 API error")
+        data = payload.get("data") or {}
+        records.extend(data.get("items") or [])
+        next_token = data.get("paginationToken")
+        if not next_token:
+            return records
+        if next_token in seen_tokens:
+            raise RuntimeError("NEA PM2.5 API returned a repeated pagination token")
+        seen_tokens.add(next_token)
+        page_token = next_token
+
+
 def get_latest_nea_pm25_hourly() -> dict:
-    """Fetch NEA's separate one-hour PM2.5 concentration readings."""
-    request = Request(_NEA_PM25_API, headers={"User-Agent": "BloodPressureBot/1.0"})
-    with urlopen(request, timeout=20) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    if payload.get("code") != 0:
+    """Fetch current NEA PM2.5 readings plus enough history for EPA NowCast."""
+    singapore_tz = pytz.timezone("Asia/Singapore")
+    now = datetime.now(singapore_tz)
+    days = [(now - timedelta(days=1)).strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d")]
+    records_by_day = _parallel_fetch(days, _fetch_nea_pm25_day, max_workers=2)
+    records = [record for day_records in records_by_day for record in day_records]
+    records = [record for record in records if record.get("timestamp")]
+    if not records:
         raise RuntimeError("NEA one-hour PM2.5 readings unavailable")
-    items = (payload.get("data") or {}).get("items") or []
-    if not items:
-        raise RuntimeError("NEA one-hour PM2.5 readings unavailable")
-    return max(items, key=lambda item: item.get("timestamp", ""))
+    latest = max(records, key=lambda record: record["timestamp"])
+    latest_time = datetime.fromisoformat(latest["timestamp"].replace("Z", "+00:00"))
+    if latest_time.tzinfo is None:
+        latest_time = singapore_tz.localize(latest_time)
+    cutoff = latest_time - timedelta(hours=11)
+    history = []
+    for record in records:
+        try:
+            timestamp = datetime.fromisoformat(record["timestamp"].replace("Z", "+00:00"))
+            if timestamp.tzinfo is None:
+                timestamp = singapore_tz.localize(timestamp)
+            if cutoff <= timestamp <= latest_time:
+                history.append(record)
+        except (TypeError, ValueError):
+            logger.info("Skipping NEA PM2.5 record with invalid timestamp %r", record.get("timestamp"))
+    return {**latest, "history": history}
+
+
+def _epa_pm25_nowcast(history: list[dict], region: str) -> tuple[float | None, int | None]:
+    """Calculate EPA's weighted 12-hour PM2.5 NowCast and its AQI estimate."""
+    timed_values = []
+    for record in history:
+        timestamp_text = record.get("timestamp")
+        try:
+            timestamp = datetime.fromisoformat(timestamp_text.replace("Z", "+00:00"))
+            if timestamp.tzinfo is None:
+                timestamp = pytz.timezone("Asia/Singapore").localize(timestamp)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        concentration = _number(
+            ((record.get("readings") or {}).get("pm25_one_hourly") or {}).get(region.lower())
+        )
+        if concentration is not None and concentration >= 0:
+            timed_values.append((timestamp, concentration))
+    if not timed_values:
+        return None, None
+
+    anchor = max(timestamp for timestamp, _ in timed_values)
+    by_hour = {}
+    for timestamp, concentration in timed_values:
+        hours_ago = round((anchor - timestamp).total_seconds() / 3600)
+        if 0 <= hours_ago <= 11:
+            by_hour[hours_ago] = concentration
+    if sum(hour in by_hour for hour in range(3)) < 2:
+        return None, None
+
+    values = list(by_hour.values())
+    maximum = max(values)
+    weight = 1.0 if maximum == 0 else max(0.5, min(values) / maximum)
+    numerator = sum(value * weight**hour for hour, value in by_hour.items())
+    denominator = sum(weight**hour for hour in by_hour)
+    nowcast = numerator / denominator
+    return nowcast, _epa_pm25_aqi(nowcast)
 
 def _format_comparison(stations, nea, nea_pm25_hourly=None):
     readings = nea.get("readings") or {}
@@ -171,6 +251,11 @@ def _format_comparison(stations, nea, nea_pm25_hourly=None):
     nea_pm25_original = [_number((readings.get("pm25_sub_index") or {}).get(region.lower())) for region in SINGAPORE_REGIONS]
     nea_pm25_conc = [_number((readings.get("pm25_twenty_four_hourly") or {}).get(region.lower())) for region in SINGAPORE_REGIONS]
     nea_pm25_scaled = [_epa_pm25_aqi(value) for value in nea_pm25_conc]
+    nea_pm25_history = (nea_pm25_hourly or {}).get("history") or [nea_pm25_hourly or {}]
+    nea_pm25_nowcasts = {
+        region: _epa_pm25_nowcast(nea_pm25_history, region)
+        for region in SINGAPORE_REGIONS
+    }
     lines.extend([
         f"- PM2.5 AQICN current AQI: {_display_number(_mean(aq_pm25))} ({sum(v is not None for v in aq_pm25)}/5)",
         f"- PM2.5 NEA sub-index (24h): {_display_number(_mean(nea_pm25_original))} ({sum(v is not None for v in nea_pm25_original)}/5)",
@@ -215,8 +300,12 @@ def _format_comparison(stations, nea, nea_pm25_hourly=None):
     nea_pm25_hourly_values = [
         _number(hourly_readings.get(region.lower())) for region in SINGAPORE_REGIONS
     ]
+    nea_pm25_nowcast_aqi = [nea_pm25_nowcasts[region][1] for region in SINGAPORE_REGIONS]
     lines.append(
         f"- PM2.5 NEA concentration (1h): {_display_number(_mean(nea_pm25_hourly_values))} ug/m3 ({sum(v is not None for v in nea_pm25_hourly_values)}/5)"
+    )
+    lines.append(
+        f"- PM2.5 EPA AQI estimate (NEA NowCast): {_display_number(_mean(nea_pm25_nowcast_aqi))} ({sum(v is not None for v in nea_pm25_nowcast_aqi)}/5)"
     )
     for station in stations:
         region = station["region"]
@@ -228,6 +317,8 @@ def _format_comparison(stations, nea, nea_pm25_hourly=None):
             f"- NEA PSI (24h): {_display_number((readings.get('psi_twenty_four_hourly') or {}).get(key))}",
             f"- PM2.5 AQICN current AQI: {_display_number(_pollutant_aqi(station, 'pm25'))}",
             f"- PM2.5 NEA 1h concentration: {_display_number(hourly_readings.get(key))} ug/m3",
+            f"- PM2.5 NEA NowCast concentration (12h): {_display_number(nea_pm25_nowcasts[region][0])} ug/m3",
+            f"- PM2.5 EPA AQI estimate (NowCast): {_display_number(nea_pm25_nowcasts[region][1])}",
             f"- PM2.5 NEA sub-index (24h): {_display_number((readings.get('pm25_sub_index') or {}).get(key))}",
             f"- PM2.5 NEA concentration (24h): {_display_number(pm25_concentration)} ug/m3",
             f"- PM2.5 NEA EPA AQI estimate (24h): {_display_number(pm25_scaled)}",
@@ -236,7 +327,7 @@ def _format_comparison(stations, nea, nea_pm25_hourly=None):
             f"- AQICN updated: {html.escape(str(station.get('time', {}).get('s') or 'N/A'))}"])
     lines.extend(["", f"- NEA PSI updated: {html.escape(str(nea.get('timestamp') or 'N/A'))}",
                   f"- NEA PM2.5 1h updated: {html.escape(str((nea_pm25_hourly or {}).get('timestamp') or 'N/A'))}",
-                  "- EPA AQI estimate uses US EPA 2024 PM2.5 breakpoints.",
+                  "- EPA NowCast uses the latest 12 NEA hourly PM2.5 readings and US EPA 2024 breakpoints.",
                   "- Sources: AQICN / NEA via data.gov.sg"])
     return "\n".join(lines)
 
