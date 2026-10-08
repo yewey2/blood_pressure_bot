@@ -303,111 +303,127 @@ async def neagraph(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image_file.name = "singapore-nea-past-24-hours.png"
     await update.effective_message.reply_photo(
         photo=image_file,
-        caption="NEA PM indices\n? Period: past 24 hours\n? Regions: North / South / East / West / Central\n? Mean: available regions\n? Source: NEA / data.gov.sg",
+        caption="NEA PM indices\nPeriod: past 24 hours\nRegions: North / South / East / West / Central\nMean: available regions\nSource: NEA / data.gov.sg",
     )
 
 
 def _aqicn_city_page(url: str) -> str:
-    """Fetch the AQICN regional page containing its native pollutant graphs."""
+    """Fetch a regional AQICN page with the published PM AQI range values."""
     request = Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; BloodPressureBot/1.0)"})
     with urlopen(request, timeout=20) as response:
         return response.read().decode("utf-8", errors="replace")
 
 
-class _AQICNGraphParser(HTMLParser):
-    """Read images only inside their own pollutant cell."""
+class _AQICNStatsParser(HTMLParser):
+    """Read AQICN's published current, minimum, and maximum AQI values."""
     def __init__(self):
         super().__init__()
-        self.pollutant = None
-        self.graphs = {}
+        self.cell_id = None
+        self.parts = []
+        self.values = {}
 
     def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
         if tag == "td":
-            cell = attrs.get("id", "").lower()
-            self.pollutant = cell[3:] if cell in ("td_pm25", "td_pm10") else None
-        if tag != "img" or not self.pollutant:
-            return
-        source = attrs.get("src", "")
-        prefix = "data:image/png;base64,"
-        if not source.startswith(prefix):
-            return
-        try:
-            raw = base64.b64decode(re.sub(r"\s+", "", source[len(prefix):]), validate=True)
-            with Image.open(io.BytesIO(raw)) as image:
-                image.verify()
-            self.graphs[self.pollutant] = raw
-        except (binascii.Error, ValueError, OSError):
-            logger.warning("Invalid AQICN %s image", self.pollutant)
+            self.cell_id = dict(attrs).get("id", "").lower()
+            self.parts = []
+
+    def handle_data(self, data):
+        if self.cell_id:
+            self.parts.append(data)
 
     def handle_endtag(self, tag):
-        if tag == "td":
-            self.pollutant = None
+        if tag == "td" and self.cell_id:
+            match = re.search(r"\d+(?:\.\d+)?", " ".join(self.parts))
+            if match:
+                self.values[self.cell_id] = float(match.group())
+            self.cell_id = None
+            self.parts = []
 
 
-def get_aqicn_pm_graphs() -> list[tuple[str, str, bytes]]:
-    """Fetch AQICN's native per-pollutant graphs for each Singapore region."""
+def get_aqicn_pm_graphs() -> list[dict]:
+    """Fetch AQICN's current and past-two-day range for each pollutant/region."""
     def fetch_region(region: str):
         try:
-            page = _aqicn_city_page(AQICN_CITY_PAGES[region])
-            parser = _AQICNGraphParser()
-            parser.feed(page)
-            return region, parser.graphs
+            parser = _AQICNStatsParser()
+            parser.feed(_aqicn_city_page(AQICN_CITY_PAGES[region]))
+            result = {"region": region}
+            for pollutant in ("pm25", "pm10"):
+                values = [parser.values.get(f"{kind}_{pollutant}") for kind in ("min", "max", "cur")]
+                minimum, maximum, current = values
+                if minimum is not None and maximum is not None and current is not None:
+                    result[pollutant] = {"min": minimum, "max": maximum, "current": current}
+            return result
         except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
-            logger.info("Unable to fetch AQICN graph for %s: %s", region, exc)
-            return region, {}
+            logger.info("Unable to fetch AQICN values for %s: %s", region, exc)
+            return {"region": region}
 
-    fetched = _parallel_fetch(list(SINGAPORE_REGIONS), fetch_region, max_workers=5)
-    return [
-        (region, pollutant, graph_bytes)
-        for region, graphs in fetched
-        for pollutant in ("pm25", "pm10")
-        if (graph_bytes := graphs.get(pollutant))
-    ]
+    return _parallel_fetch(list(SINGAPORE_REGIONS), fetch_region, max_workers=5)
 
 
-def _render_aqicn_graph_panel(graphs) -> bytes:
-    """Place native AQICN sparklines on a readable Telegram-sized canvas."""
-    lookup = {(region, pollutant): raw for region, pollutant, raw in graphs}
-    canvas = Image.new("RGB", (1000, 1040), "white")
-    draw = ImageDraw.Draw(canvas)
-    draw.text((25, 15), "AQICN Singapore - native AQI trends - past 2 days", fill="black", font_size=24)
-    draw.text((25, 50), "Source: aqicn.org | Left to right: older to newer", fill="black", font_size=18)
-    for row, region in enumerate(SINGAPORE_REGIONS):
-        y = 95 + row * 185
-        draw.text((25, y), region, fill="black", font_size=23)
-        for col, pollutant in enumerate(("pm25", "pm10")):
-            x = 25 + col * 490
-            label = "PM2.5 AQI" if pollutant == "pm25" else "PM10 AQI"
-            draw.text((x, y + 32), label, fill="black", font_size=19)
-            raw = lookup.get((region, pollutant))
-            if not raw:
-                draw.text((x, y + 75), "Unavailable", fill="gray", font_size=18)
-                continue
-            with Image.open(io.BytesIO(raw)) as source:
-                source = source.convert("RGBA")
-                source.thumbnail((450, 100))
-                scale = min(450 / source.width, 100 / source.height)
-                resized = source.resize((round(source.width * scale), round(source.height * scale)))
-                canvas.paste(resized, (x, y + 65), resized)
+def _render_aqicn_graph_panel(regions) -> bytes:
+    """Plot AQICN's published 48-hour min/max ranges and current values."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8), constrained_layout=True)
+    colors = {"North": "#0077b6", "South": "#e76f51", "East": "#2a9d8f",
+              "West": "#9b5de5", "Central": "#f4a261"}
+    for ax, pollutant, title in zip(axes, ("pm25", "pm10"), ("PM2.5 AQI", "PM10 AQI")):
+        valid = [(i, region, region.get(pollutant)) for i, region in enumerate(regions)
+                 if region.get(pollutant)]
+        if not valid:
+            ax.text(0.5, 0.5, "AQICN values unavailable", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=14)
+            ax.set_title(title)
+            continue
+        lows = [entry[2]["min"] for entry in valid]
+        highs = [entry[2]["max"] for entry in valid]
+        axis_min = max(0, min(lows) - max(5, (max(highs) - min(lows)) * 0.12))
+        axis_max = min(500, max(highs) + max(5, (max(highs) - min(lows)) * 0.12))
+        for y, region, stats in valid:
+            color = colors[region["region"]]
+            ax.hlines(y, stats["min"], stats["max"], color=color, linewidth=8, alpha=0.72)
+            ax.scatter(stats["current"], y, color=color, edgecolor="black", s=100,
+                       zorder=3, label="Current" if y == valid[0][0] else None)
+            ax.annotate(f"{stats['min']:g}", (stats["min"], y), xytext=(0, -18),
+                        textcoords="offset points", ha="center", fontsize=10)
+            ax.annotate(f"{stats['max']:g}", (stats["max"], y), xytext=(0, -18),
+                        textcoords="offset points", ha="center", fontsize=10)
+            ax.annotate(f"Now {stats['current']:g}", (stats["current"], y), xytext=(0, 13),
+                        textcoords="offset points", ha="center", fontsize=10, fontweight="bold")
+        ax.set_yticks(range(len(SINGAPORE_REGIONS)), SINGAPORE_REGIONS)
+        ax.set_ylim(-0.65, len(SINGAPORE_REGIONS) - 0.35)
+        ax.invert_yaxis()
+        ax.set_xlim(axis_min, max(axis_min + 1, axis_max))
+        ax.set_xlabel("AQI")
+        ax.set_title(title, loc="left", fontsize=17, fontweight="bold")
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=8, integer=True))
+        ax.grid(axis="x", color="#d9e0e5", linewidth=0.8)
+        ax.set_axisbelow(True)
+    fig.suptitle("AQICN Singapore | current and 48-hour AQI range", fontsize=20, fontweight="bold")
+    fig.text(0.5, -0.015, "Bars: minimum to maximum | Dot: current | Source: AQICN", ha="center", fontsize=11)
     output = io.BytesIO()
-    canvas.save(output, format="PNG")
+    fig.savefig(output, format="png", dpi=180, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
     return output.getvalue()
 
 
 async def psigraph(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        graphs = await asyncio.to_thread(get_aqicn_pm_graphs)
-        if not graphs:
-            raise RuntimeError("No AQICN graphs")
-        graph_bytes = await asyncio.to_thread(_render_aqicn_graph_panel, graphs)
+        regions = await asyncio.to_thread(get_aqicn_pm_graphs)
+        if not any(region.get("pm25") or region.get("pm10") for region in regions):
+            raise RuntimeError("No AQICN values")
+        graph_bytes = await asyncio.to_thread(_render_aqicn_graph_panel, regions)
     except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError, OSError) as exc:
         logger.warning("AQICN graph request failed: %s", exc)
-        await update.effective_message.reply_text("? AQICN graphs: unavailable\n? Retry: /psigraph")
+        await update.effective_message.reply_text("AQICN values: unavailable\nRetry: /psigraph")
         return
     image_file = io.BytesIO(graph_bytes)
-    image_file.name = "singapore-aqicn-trends.png"
+    image_file.name = "singapore-aqicn-ranges.png"
     await update.effective_message.reply_photo(
         photo=image_file,
-        caption=f"AQICN PM trends\n? Scale: AQI\n? Period: past 2 days\n? Graphs: {len(graphs)}/10\n? Source: aqicn.org",
+        caption="AQICN PM2.5 and PM10\nRange: past 48 hours\nBars: minimum to maximum\nDot: current value\nSource: AQICN",
     )
