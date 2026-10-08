@@ -56,6 +56,11 @@ def get_singapore_psi() -> list[dict]:
     def fetch_region(region):
         try:
             feed = _aqicn_request(f"feed/Singapore/{region}/")
+            source_name = str((feed.get("city") or {}).get("name") or "")
+            if region.casefold() not in source_name.casefold():
+                raise RuntimeError(
+                    f"AQICN returned {source_name or 'an unnamed feed'} for {region}"
+                )
         except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError) as exc:
             logger.warning("AQICN feed unavailable for %s: %s", region, exc)
             feed = None
@@ -104,6 +109,29 @@ def _display_number(value) -> str:
     return str(round(number)) if number.is_integer() else f"{number:.1f}"
 
 
+
+def _epa_pm25_aqi(concentration):
+    """Convert NEA PM2.5 concentration (ug/m3) to the current US EPA AQI."""
+    value = _number(concentration)
+    if value is None or value < 0:
+        return None
+    value = int(value * 10) / 10  # EPA truncates PM2.5 concentration to 0.1 ug/m3.
+    breakpoints = (
+        (0.0, 9.0, 0, 50),
+        (9.1, 35.4, 51, 100),
+        (35.5, 55.4, 101, 150),
+        (55.5, 125.4, 151, 200),
+        (125.5, 225.4, 201, 300),
+        (225.5, 325.4, 301, 500),
+    )
+    for c_low, c_high, i_low, i_high in breakpoints:
+        if c_low <= value <= c_high:
+            return round((i_high - i_low) / (c_high - c_low) * (value - c_low) + i_low)
+    if value > 325.4:
+        c_low, c_high, i_low, i_high = breakpoints[-1]
+        return round((i_high - i_low) / (c_high - c_low) * (value - c_low) + i_low)
+    return None
+
 def get_latest_nea_psi() -> dict:
     request = Request(_NEA_AIR_API, headers={"User-Agent": "BloodPressureBot/1.0"})
     with urlopen(request, timeout=20) as response:
@@ -116,50 +144,124 @@ def get_latest_nea_psi() -> dict:
     return max(items, key=lambda item: item.get("timestamp", ""))
 
 
-def _format_comparison(stations, nea):
+
+def get_latest_nea_pm25_hourly() -> dict:
+    """Fetch NEA's separate one-hour PM2.5 concentration readings."""
+    request = Request(_NEA_PM25_API, headers={"User-Agent": "BloodPressureBot/1.0"})
+    with urlopen(request, timeout=20) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if payload.get("code") != 0:
+        raise RuntimeError("NEA one-hour PM2.5 readings unavailable")
+    items = (payload.get("data") or {}).get("items") or []
+    if not items:
+        raise RuntimeError("NEA one-hour PM2.5 readings unavailable")
+    return max(items, key=lambda item: item.get("timestamp", ""))
+
+def _format_comparison(stations, nea, nea_pm25_hourly=None):
     readings = nea.get("readings") or {}
     lines = ["<b>Singapore air quality</b>",
-             "? AQICN: AQI scale", "? NEA: 24-hour PSI scale",
-             "? Comparison: different scales / averaging periods", "",
-             "<b>Regional means</b>"]
-    for label, aq_key, nea_key in (("PM2.5", "pm25", "pm25_sub_index"),
-                                  ("PM10", "pm10", "pm10_sub_index")):
-        aq = [_number(_pollutant_aqi(s, aq_key)) for s in stations]
-        ne = [_number((readings.get(nea_key) or {}).get(r.lower())) for r in SINGAPORE_REGIONS]
-        lines.append(f"? {label} AQI: {_display_number(_mean(aq))} ({sum(v is not None for v in aq)}/5)")
-        lines.append(f"? {label} NEA index: {_display_number(_mean(ne))} ({sum(v is not None for v in ne)}/5)")
+             "- AQICN: current AQI (Instant Cast)",
+             "- NEA PSI and sub-indices: rolling 24-hour",
+             "- NEA PM2.5 concentration: 1-hour and 24-hour",
+             "- PSI: highest pollutant sub-index",
+             "- AQICN Singapore data source: NEA",
+             "",
+             "<b>Regional means</b> (equal-weight mean; not an official Singapore-wide index)"]
+    aq_pm25 = [_number(_pollutant_aqi(station, "pm25")) for station in stations]
+    nea_pm25_original = [_number((readings.get("pm25_sub_index") or {}).get(region.lower())) for region in SINGAPORE_REGIONS]
+    nea_pm25_conc = [_number((readings.get("pm25_twenty_four_hourly") or {}).get(region.lower())) for region in SINGAPORE_REGIONS]
+    nea_pm25_scaled = [_epa_pm25_aqi(value) for value in nea_pm25_conc]
+    lines.extend([
+        f"- PM2.5 AQICN current AQI: {_display_number(_mean(aq_pm25))} ({sum(v is not None for v in aq_pm25)}/5)",
+        f"- PM2.5 NEA sub-index (24h): {_display_number(_mean(nea_pm25_original))} ({sum(v is not None for v in nea_pm25_original)}/5)",
+        f"- PM2.5 NEA EPA AQI estimate (24h): {_display_number(_mean(nea_pm25_scaled))} ({sum(v is not None for v in nea_pm25_scaled)}/5)",
+    ])
+    aq_pm10 = [_number(_pollutant_aqi(station, "pm10")) for station in stations]
+    nea_pm10 = [_number((readings.get("pm10_sub_index") or {}).get(region.lower())) for region in SINGAPORE_REGIONS]
+    lines.extend([
+        f"- PM10 AQICN-reported AQI: {_display_number(_mean(aq_pm10))} ({sum(v is not None for v in aq_pm10)}/5)",
+        f"- PM10 NEA sub-index (24h): {_display_number(_mean(nea_pm10))} ({sum(v is not None for v in nea_pm10)}/5)",
+    ])
+    pm10_matches = sum(
+        aq is not None and nea_value is not None and aq == nea_value
+        for aq, nea_value in zip(aq_pm10, nea_pm10)
+    )
+    if pm10_matches:
+        lines.append(
+            f"- PM10 AQICN and NEA values match: {pm10_matches}/5 regions; shared NEA source, not independent confirmation"
+        )
+    psi_values = [
+        _number((readings.get("psi_twenty_four_hourly") or {}).get(region.lower()))
+        for region in SINGAPORE_REGIONS
+    ]
+    pm25_matches_psi = sum(
+        psi is not None and subindex is not None and psi == subindex
+        for psi, subindex in zip(psi_values, nea_pm25_original)
+    )
+    if pm25_matches_psi:
+        lines.append(
+            f"- PSI equals the PM2.5 sub-index: {pm25_matches_psi}/5 regions; PM2.5 is the PSI driver there"
+        )
+    aqicn_overall = [_number(station.get("aqi")) for station in stations]
+    aqicn_pm25_matches = sum(
+        overall is not None and pm25 is not None and overall == pm25
+        for overall, pm25 in zip(aqicn_overall, aq_pm25)
+    )
+    if aqicn_pm25_matches:
+        lines.append(
+            f"- AQICN overall equals PM2.5 AQI: {aqicn_pm25_matches}/5 regions; PM2.5 drives the reported AQI there"
+        )
+    hourly_readings = ((nea_pm25_hourly or {}).get("readings") or {}).get("pm25_one_hourly") or {}
+    nea_pm25_hourly_values = [
+        _number(hourly_readings.get(region.lower())) for region in SINGAPORE_REGIONS
+    ]
+    lines.append(
+        f"- PM2.5 NEA concentration (1h): {_display_number(_mean(nea_pm25_hourly_values))} ug/m3 ({sum(v is not None for v in nea_pm25_hourly_values)}/5)"
+    )
     for station in stations:
         region = station["region"]
         key = region.lower()
-        def nea_value(metric):
-            return _display_number((readings.get(metric) or {}).get(key))
+        pm25_concentration = (readings.get("pm25_twenty_four_hourly") or {}).get(key)
+        pm25_scaled = _epa_pm25_aqi(pm25_concentration)
         lines.extend(["", f"<b>{html.escape(region)}</b>",
-            f"? AQICN AQI: {_display_number(station.get('aqi'))}",
-            f"? NEA PSI (24h): {nea_value('psi_twenty_four_hourly')}",
-            f"? PM2.5 AQI: {_display_number(_pollutant_aqi(station, 'pm25'))}",
-            f"? PM2.5 NEA index: {nea_value('pm25_sub_index')}",
-            f"? PM10 AQI: {_display_number(_pollutant_aqi(station, 'pm10'))}",
-            f"? PM10 NEA index: {nea_value('pm10_sub_index')}",
-            f"? AQICN updated: {html.escape(str(station.get('time', {}).get('s') or 'N/A'))}"])
-    lines.extend(["", f"? NEA updated: {html.escape(str(nea.get('timestamp') or 'N/A'))}",
-                  "? Sources: AQICN / NEA via data.gov.sg"])
+            f"- AQICN current overall AQI: {_display_number(station.get('aqi'))}",
+            f"- NEA PSI (24h): {_display_number((readings.get('psi_twenty_four_hourly') or {}).get(key))}",
+            f"- PM2.5 AQICN current AQI: {_display_number(_pollutant_aqi(station, 'pm25'))}",
+            f"- PM2.5 NEA 1h concentration: {_display_number(hourly_readings.get(key))} ug/m3",
+            f"- PM2.5 NEA sub-index (24h): {_display_number((readings.get('pm25_sub_index') or {}).get(key))}",
+            f"- PM2.5 NEA concentration (24h): {_display_number(pm25_concentration)} ug/m3",
+            f"- PM2.5 NEA EPA AQI estimate (24h): {_display_number(pm25_scaled)}",
+            f"- PM10 AQICN-reported AQI: {_display_number(_pollutant_aqi(station, 'pm10'))}",
+            f"- PM10 NEA sub-index (24h): {_display_number((readings.get('pm10_sub_index') or {}).get(key))}",
+            f"- AQICN updated: {html.escape(str(station.get('time', {}).get('s') or 'N/A'))}"])
+    lines.extend(["", f"- NEA PSI updated: {html.escape(str(nea.get('timestamp') or 'N/A'))}",
+                  f"- NEA PM2.5 1h updated: {html.escape(str((nea_pm25_hourly or {}).get('timestamp') or 'N/A'))}",
+                  "- EPA AQI estimate uses US EPA 2024 PM2.5 breakpoints.",
+                  "- Sources: AQICN / NEA via data.gov.sg"])
     return "\n".join(lines)
 
 
 async def psi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results = await asyncio.gather(asyncio.to_thread(get_singapore_psi),
-                                   asyncio.to_thread(get_latest_nea_psi), return_exceptions=True)
-    stations, nea = results
+                                   asyncio.to_thread(get_latest_nea_psi),
+                                   asyncio.to_thread(get_latest_nea_pm25_hourly), return_exceptions=True)
+    stations, nea, nea_pm25_hourly = results
     if isinstance(stations, Exception):
         logger.warning("AQICN readings unavailable: %s", stations)
         stations = [_compact_aqicn_feed(r, None) for r in SINGAPORE_REGIONS]
     if isinstance(nea, Exception):
         logger.warning("NEA readings unavailable: %s", nea)
         nea = {}
-    await update.effective_message.reply_text(_format_comparison(stations, nea), parse_mode=ParseMode.HTML)
+    if isinstance(nea_pm25_hourly, Exception):
+        logger.warning("NEA one-hour PM2.5 request failed: %s", nea_pm25_hourly)
+        nea_pm25_hourly = {}
+    await update.effective_message.reply_text(
+        _format_comparison(stations, nea, nea_pm25_hourly), parse_mode=ParseMode.HTML
+    )
 
 
 _NEA_AIR_API = "https://api-open.data.gov.sg/v2/real-time/api/psi"
+_NEA_PM25_API = "https://api-open.data.gov.sg/v2/real-time/api/pm25"
 _NEA_REGION_KEYS = {region.lower(): region for region in SINGAPORE_REGIONS}
 
 
