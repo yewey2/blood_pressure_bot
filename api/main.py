@@ -339,51 +339,8 @@ def _extract_pm_graphs(page: str) -> dict[str, bytes]:
     return graphs
 
 
-def _latest_24h_graph(image: Image.Image) -> Image.Image:
-    """AQICN's native trend spans two days; retain its newest (right-hand) day."""
-    split = max(0, image.width // 2 - 1)
-    return image.crop((split, 0, image.width, image.height)).copy()
-
-
-def _build_region_graph(region: str, graph_bytes: dict[str, bytes]) -> bytes:
-    """Make one readable Telegram image containing the two particulate charts."""
-    charts = []
-    for pollutant in ("pm25", "pm10"):
-        raw_image = graph_bytes.get(pollutant)
-        if not raw_image:
-            continue
-        with Image.open(io.BytesIO(raw_image)) as image:
-            chart = _latest_24h_graph(image.convert("RGB"))
-            charts.append((pollutant, chart.resize((chart.width * 3, chart.height * 3))))
-    if not charts:
-        raise ValueError(f"AQICN supplied no PM graphs for {region}.")
-
-    from PIL import ImageDraw, ImageFont
-
-    width = max(chart.width for _, chart in charts) + 40
-    height = 88 + sum(chart.height + 42 for _, chart in charts) + 28
-    canvas = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(canvas)
-    bold_font = ImageFont.load_default()
-    draw.rectangle((0, 0, width, 58), fill="#138fcc")
-    draw.text((20, 13), f"{region}, Singapore - latest 24 hours", fill="white", font=bold_font)
-    draw.text((20, 70), "AQICN two-day trend cropped to its latest 24-hour half", fill="#555555")
-    y_position = 94
-    labels = {"pm25": "PM2.5 AQI", "pm10": "PM10 AQI"}
-    for pollutant, chart in charts:
-        draw.text((20, y_position), labels[pollutant], fill="#222222", font=bold_font)
-        y_position += 18
-        canvas.paste(chart, (20, y_position))
-        y_position += chart.height + 24
-    draw.text((20, height - 20), "Source: World Air Quality Index (AQICN) / Singapore NEA", fill="#555555")
-
-    output = io.BytesIO()
-    canvas.save(output, format="PNG", optimize=True)
-    return output.getvalue()
-
-
-def get_singapore_pm_graphs() -> list[tuple[str, bytes]]:
-    """Build one ephemeral 24-hour PM graph per named Singapore region."""
+def get_singapore_pm_graphs() -> list[tuple[str, str, bytes]]:
+    """Fetch AQICN's original PM2.5/PM10 graph images for each region."""
     def fetch_region(region: str):
         try:
             return region, _extract_pm_graphs(_aqicn_city_page(AQICN_CITY_PAGES[region]))
@@ -394,15 +351,15 @@ def get_singapore_pm_graphs() -> list[tuple[str, bytes]]:
     graph_sets = _parallel_fetch(list(SINGAPORE_REGIONS), fetch_region, max_workers=5)
     graphs = []
     for region, graph_bytes in graph_sets:
-        try:
-            graphs.append((region, _build_region_graph(region, graph_bytes)))
-        except (ValueError, OSError) as exc:
-            logger.info("Unable to build AQICN graph for %s: %s", region, exc)
+        for pollutant in ("pm25", "pm10"):
+            image_bytes = graph_bytes.get(pollutant)
+            if image_bytes:
+                graphs.append((region, pollutant, image_bytes))
     return graphs
 
 
 async def psigraph(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send native AQICN-based 24-hour PM trend images for all five regions."""
+    """Send AQICN's original PM trend images for all five regions."""
     try:
         graphs = await asyncio.to_thread(get_singapore_pm_graphs)
     except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
@@ -420,30 +377,31 @@ async def psigraph(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     caption = (
         "<b>Singapore PM trend graphs</b>\n"
-        "PM2.5 and PM10 AQI only. Each image is the latest 24-hour half of AQICN's native two-day trend. "
+        "PM2.5 and PM10 AQI only. Images are shown in AQICN's original format. "
         "Source: Singapore NEA via World Air Quality Index (AQICN)."
     )
-    if len(graphs) == 1:
-        region, image_bytes = graphs[0]
-        image_file = io.BytesIO(image_bytes)
-        image_file.name = f"singapore-{region.lower()}-pm-24h.png"
-        await update.effective_message.reply_photo(
-            photo=image_file, caption=caption, parse_mode=ParseMode.HTML
-        )
-        return
-
     media = []
-    for index, (region, image_bytes) in enumerate(graphs):
+    for index, (region, pollutant, image_bytes) in enumerate(graphs):
         image_file = io.BytesIO(image_bytes)
-        image_file.name = f"singapore-{region.lower()}-pm-24h.png"
+        image_file.name = f"singapore-{region.lower()}-{pollutant}.png"
+        image_caption = f"{region} — {'PM2.5' if pollutant == 'pm25' else 'PM10'} AQI"
         media.append(
             InputMediaPhoto(
                 media=image_file,
-                caption=caption if index == 0 else None,
+                caption=f"{caption}\n{image_caption}" if index == 0 else image_caption,
                 parse_mode=ParseMode.HTML if index == 0 else None,
             )
         )
-    await update.effective_message.reply_media_group(media=media)
+    if len(media) == 1:
+        only_photo = media[0]
+        await update.effective_message.reply_photo(
+            photo=only_photo.media,
+            caption=only_photo.caption,
+            parse_mode=only_photo.parse_mode,
+        )
+        return
+    for start in range(0, len(media), 10):
+        await update.effective_message.reply_media_group(media=media[start : start + 10])
 
 
 try:
