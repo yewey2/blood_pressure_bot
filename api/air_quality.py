@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 
 import pytz
 from PIL import Image, ImageDraw
-from telegram import Update
+from telegram import InputMediaPhoto, Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
@@ -262,6 +262,10 @@ def _format_comparison(stations, nea, nea_pm25_hourly=None):
     hourly = nea_pm25_hourly or {}
     hourly_readings = (hourly.get("readings") or {}).get("pm25_one_hourly") or {}
     history = hourly.get("history") or [hourly]
+    estimated_aqis = {
+        region: _epa_pm25_nowcast(history, region)[1]
+        for region in SINGAPORE_REGIONS
+    }
 
     lines = [
         "<b>Singapore - regional averages</b>",
@@ -273,17 +277,17 @@ def _format_comparison(stations, nea, nea_pm25_hourly=None):
         "<b>NEA</b>",
         _index_line("PSI (24h)", _mean(psi_readings.get(region.lower()) for region in SINGAPORE_REGIONS), psi=True),
         f"- <b>PM2.5 (1h) {_display_number(_mean(hourly_readings.get(region.lower()) for region in SINGAPORE_REGIONS))} ug/m3</b>",
+        _index_line("EPA AQI est. (NowCast)", _mean(estimated_aqis.values())),
     ]
     for region, station in zip(SINGAPORE_REGIONS, regional_stations):
         key = region.lower()
-        _, estimated_aqi = _epa_pm25_nowcast(history, region)
         lines.extend([
             "",
             f"<b>{region}</b>",
             _index_line("AQICN PM2.5", _pollutant_aqi(station, "pm25")),
             _index_line("AQICN PM10", _pollutant_aqi(station, "pm10")),
             f"- <b>NEA PM2.5 (1h) {_display_number(hourly_readings.get(key))} ug/m3</b>",
-            _index_line("EPA AQI est. (NowCast)", estimated_aqi),
+            _index_line("EPA AQI est. (NowCast)", estimated_aqis[region]),
             _index_line("NEA PSI (24h)", psi_readings.get(key), psi=True),
         ])
     return "\n".join(lines)
@@ -580,29 +584,53 @@ async def psigraph(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def graphs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send both NEA and AQICN graphs in one message."""
-    try:
-        points = await asyncio.to_thread(get_singapore_pm_history)
-        regions = await asyncio.to_thread(get_aqicn_pm_graphs)
-        if not points:
-            raise RuntimeError("NEA returned no PM index data for the past 24 hours")
-        if not any(region.get("pm25") or region.get("pm10") for region in regions):
-            raise RuntimeError("No AQICN values")
-        nea_bytes = await asyncio.to_thread(_render_singapore_pm_graph, points)
-        aqicn_bytes = await asyncio.to_thread(_render_aqicn_graph_panel, regions)
-    except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError, OSError) as exc:
-        logger.warning("Singapore air-quality graphs failed: %s", exc)
-        await update.effective_message.reply_text(
-            "Could not fetch Singapore's air-quality graphs right now. Please try again later."
-        )
-        return
-    nea_file = io.BytesIO(nea_bytes)
-    nea_file.name = "singapore-nea-past-24-hours.png"
-    aqicn_file = io.BytesIO(aqicn_bytes)
-    aqicn_file.name = "singapore-aqicn-ranges.png"
-    await update.effective_message.reply_media_group(
-        media=[
-            {"type": "photo", "media": nea_file, "caption": "NEA PM indices\nPeriod: past 24 hours\nRegions: North / South / East / West / Central\nMean: available regions\nSource: NEA / data.gov.sg"},
-            {"type": "photo", "media": aqicn_file, "caption": "AQICN PM2.5 and PM10\nRange: past 48 hours\nBars: minimum to maximum\nDot: current value\nSource: AQICN"},
-        ]
+    """Send available graphs; one unavailable source must not hide the other."""
+    results = await asyncio.gather(
+        asyncio.to_thread(get_singapore_pm_history),
+        asyncio.to_thread(get_aqicn_pm_graphs),
+        return_exceptions=True,
     )
+    sources = (
+        ("NEA", _render_singapore_pm_graph, "singapore-nea-past-24-hours.png",
+         "NEA PM indices\nPeriod: past 24 hours\nRegions: North / South / East / West / Central\nMean: available regions\nSource: NEA / data.gov.sg"),
+        ("AQICN", _render_aqicn_graph_panel, "singapore-aqicn-ranges.png",
+         "AQICN PM2.5 and PM10\nRange: past 48 hours\nBars: minimum to maximum\nDot: current value\nSource: AQICN"),
+    )
+    photos = []
+    unavailable = []
+    for (source, render, filename, caption), data in zip(sources, results):
+        try:
+            if isinstance(data, Exception):
+                raise data
+            if source == "NEA":
+                has_values = any(point.get("PM2.5") or point.get("PM10") for point in data)
+            else:
+                has_values = any(region.get("pm25") or region.get("pm10") for region in data)
+            if not has_values:
+                raise RuntimeError(f"{source} returned no PM graph values")
+            # Render sequentially: matplotlib's pyplot state is shared between threads.
+            graph_bytes = await asyncio.to_thread(render, data)
+        except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError, OSError, ImportError):
+            logger.warning("%s air-quality graph failed", source, exc_info=True)
+            unavailable.append(source)
+            continue
+        image_file = io.BytesIO(graph_bytes)
+        image_file.name = filename
+        photos.append((image_file, caption))
+
+    if not photos:
+        await update.effective_message.reply_text(
+            "Singapore's air-quality graphs are unavailable (NEA and AQICN). "
+            "Please try /graphs again later."
+        )
+    elif len(photos) == 1:
+        image_file, caption = photos[0]
+        await update.effective_message.reply_photo(
+            photo=image_file,
+            caption=f"{caption}\n\n{' / '.join(unavailable)} graph unavailable. Retry: /graphs",
+        )
+    else:
+        await update.effective_message.reply_media_group(
+            media=[InputMediaPhoto(media=image_file, caption=caption)
+                   for image_file, caption in photos]
+        )
