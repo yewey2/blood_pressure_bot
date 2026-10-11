@@ -119,7 +119,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-from api.air_quality import psi, psigraph, neagraph
+from api.air_quality import psi, psigraph, neagraph, graphs
 
 
 try:
@@ -304,6 +304,7 @@ ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(CommandHandler("psi", psi))
 ptb_app.add_handler(CommandHandler("psigraph", psigraph))
 ptb_app.add_handler(CommandHandler("neagraph", neagraph))
+ptb_app.add_handler(CommandHandler("graphs", graphs))
 ptb_app.add_handler(MessageHandler(filters.PHOTO, image_handler))
 ptb_app.add_handler(TypeHandler(type=WebhookUpdate, callback=webhook_update))
 ptb_app.add_error_handler(error_handler)
